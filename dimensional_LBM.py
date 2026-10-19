@@ -6,7 +6,7 @@ Created on Thu Oct 15 11:18:18 2026
 """
 import numpy as np
 import matplotlib.pyplot as plt
-
+from scipy.optimize import root_scalar
 
 #####Setup
 Lx = 0.03  #m
@@ -85,9 +85,9 @@ switch_y[solids] = 0
 
 
 #Fluid properties
-T = 323 #K
+T = 325 #K
 P = 10E6 #Pa
-rho_W = 992.2 #kg/m3
+rho_W = 991 #kg/m3
 rho_H = 7.1 #kg/m3
 Dvisc_H = 9.63E-6 #Pa s
 Dvisc_W = 5.51E-4 #Pa s
@@ -115,18 +115,119 @@ Pc_W = 22.064E6
 mm_W = 18.015E-3                          #and for water
 ace_W = 0.344                 #acentric factor
 m_W = 0.37464+1.5422*ace_W-0.26992*ace_W**2     #interim value
-alpha_W = (1+m_W*(1-np.sqrt(T/Tc_W)))**2        #interim value
 A_W = 0.45724*(R**2)*(Tc_W**2)/Pc_W  
 B_W = 0.0778*R*Tc_W/Pc_W    
-shift_W = -0.00024
 
-def EOS_PR(dens, mm, A, B, alpha, shift):
+#shift calculation for Water phase
+a_sh = -2.015467360734e-04
+b_sh = -1.815231199047e-05
+c_sh = -2.145348387696e-06
+d_sh = 9.366353912807e-07
+e_sh = 6.804086810097e-07
+f_sh = 3.035207075944e-08
+def water_shift(T,P):
+    x = (T-350)/50
+    y = (P/1E6-20)/10
+    return a_sh + b_sh*x + c_sh*y + d_sh*x**2 + e_sh*x*y + f_sh*y**2
+shift_W = water_shift(T,P)
+
+def EOS_PR(dens, mm, A, B, alpha, shift, T):
     dens_ = dens/(1-shift*dens)
     n = dens_/mm
     P = (n*R*T)/(1-B*n) - A*alpha*n**2/(1+2*B*n-B**2*n**2)
     return P
-print(EOS_PR(rho_W,mm_W,A_W,B_W,alpha_W,shift_W)/1E6)
-          
+
+
+Ps = np.array([10, 15, 20, 25, 30]) * 1e6  # Pa
+Ts = np.array([300, 325, 350, 375, 400])   # K
+
+rhos = np.array([
+    [1000.96, 1003.14, 1005.31, 1007.45, 1009.57],
+    [ 991.46,  993.58,  995.68,  997.76,  999.81],
+    [ 978.09,  980.25,  982.39,  984.50,  986.59],
+    [ 961.62,  963.90,  966.14,  968.36,  970.55],
+    [ 942.42,  944.88,  947.31,  949.70,  952.05],
+])
+
+
+def residual(shift, T, P, rho):
+    alpha = (1 + m_W * (1 - np.sqrt(T / Tc_W)))**2
+    return EOS_PR(rho, mm_W, A_W, B_W, alpha, shift, T) - P
+
+
+shifts = np.zeros(rhos.shape)
+
+for t, temperature in enumerate(Ts):
+    for p, pressure in enumerate(Ps):
+        rho = rhos[t, p]
+        upper = 1 / rho - B_W / mm_W - 1e-9
+
+        shifts[t, p] = root_scalar(
+            residual,
+            args=(temperature, pressure, rho),  # Already Pa
+            bracket=[-0.01, upper],
+            method="brentq",
+            xtol=1e-14,
+        ).root
+
+
+# Quadratic basis: T in K, P in Pa
+def shift_basis(T, P):
+    T, P = np.broadcast_arrays(
+        np.asarray(T, dtype=float),
+        np.asarray(P, dtype=float),
+    )
+    x = (T - 350) / 50
+    y = (P - 20e6) / 10e6
+
+    return np.stack(
+        [np.ones_like(x), x, y, x**2, x*y, y**2],
+        axis=-1,
+    )
+
+
+T_grid, P_grid = np.meshgrid(Ts, Ps, indexing="ij")
+basis = shift_basis(T_grid, P_grid)
+
+# The model is linear in its six coefficients
+coeffs = np.linalg.lstsq(
+    basis.reshape(-1, 6),
+    shifts.ravel(),
+    rcond=None,
+)[0]
+
+
+def water_shift(T, P):  # K, Pa → m³/kg
+    return shift_basis(T, P) @ coeffs
+
+
+shifts_fit = water_shift(T_grid, P_grid)
+
+for name, value in zip("abcdef", coeffs):
+    print(f"{name} = {value:.12e}")
+
+print(f"RMSE: {np.sqrt(np.mean((shifts - shifts_fit)**2)):.6e} m³/kg")
+print(f"Max error: {np.max(np.abs(shifts - shifts_fit)):.6e} m³/kg")
+
+# Check the resulting EOS pressures at the calibration points
+P_fit = np.empty_like(shifts)
+
+for t, temperature in enumerate(Ts):
+    alpha = (1 + m_W * (1 - np.sqrt(temperature / Tc_W)))**2
+
+    for p, pressure in enumerate(Ps):
+        P_fit[t, p] = EOS_PR(
+            rhos[t, p], mm_W, A_W, B_W,
+            alpha, shifts_fit[t, p], temperature,
+        )
+
+print(f"Max pressure error: {np.max(np.abs(P_fit - P_grid))/1e6:.6f} MPa")
+
+shift_W = water_shift(323, 10e6)
+print(f"Shift at 323 K, 10 MPa: {shift_W:.8e} m³/kg")
+
+
+
 
 #MRT
 M = np.array([[1,1,1,1,1,1,1,1,1],[-4*c**2,-c**2,-c**2,-c**2,-c**2,2*c**2,2*c**2,2*c**2,2*c**2],     #Transformation matrix M
